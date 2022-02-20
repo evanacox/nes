@@ -23,7 +23,7 @@ pub struct CPU6502<'a> {
 }
 
 impl<'a> CPU6502<'a> {
-    pub fn new(bus: &'a Bus) -> Self<'a> {
+    pub fn new(bus: &'a Bus) -> Self {
         Self {
             a: 0,
             x: 0,
@@ -37,9 +37,10 @@ impl<'a> CPU6502<'a> {
     }
 
     pub fn cycle(&mut self) {
+        let info = &INSTR_LOOKUP[0x12];
+
         if self.cycles_left == 0 {
-            let info = &INSTR_LOOKUP[0x55];
-            info.executor(self);
+            (info.executor)(self);
             self.cycles_left = info.cycles - 1;
         }
 

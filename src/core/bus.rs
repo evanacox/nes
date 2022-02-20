@@ -8,11 +8,6 @@
 //                                                                           //
 //======---------------------------------------------------------------======//
 
-pub enum RW {
-    Read,
-    Write,
-}
-
 pub struct Bus {
     /// The last address used by any instruction
     address: u16,
@@ -22,10 +17,15 @@ pub struct Bus {
 
 impl Bus {
     pub fn read(&mut self, address: u16) -> u8 {
-        0
+        self.address = address;
+
+        unimplemented!()
     }
 
     pub fn write(&mut self, address: u16, data: u8) {
-        //
+        self.address = address;
+        self.data = data;
+
+        unimplemented!()
     }
 }

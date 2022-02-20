@@ -10,6 +10,7 @@
 
 mod bus;
 mod cpu;
+mod clock;
 mod lookup;
 
 pub use bus::*;
