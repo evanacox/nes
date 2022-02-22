@@ -8,54 +8,56 @@
 //                                                                           //
 //======---------------------------------------------------------------======//
 
-use crate::core::CPU6502;
+use crate::core::{Operand, CPU6502};
 
+/// Information about a given opcode
 pub(crate) struct Info {
+    /// A human-readable name of the opcode
     pub(crate) name: &'static str,
-    pub(crate) executor: fn(&mut CPU6502),
-    pub(crate) operands: fn(&mut CPU6502) -> u8,
+    /// The instruction executor method on the CPU that handles this opcode
+    pub(crate) executor: fn(&mut CPU6502, Operand) -> bool,
+    /// The operand method on the CPU that correctly reads the instruction's operand(s)
+    pub(crate) operands: fn(&mut CPU6502) -> Operand,
+    /// The number of cycles this instruction is supposed to take
     pub(crate) cycles: u16,
 }
 
 macro_rules! inst {
-    ($method:ident) => {
-        {
-            fn inner(this: &mut CPU6502<'_>) {
-                this.$method()
-            }
-            
-            inner
+    ($method:ident) => {{
+        fn inner(this: &mut CPU6502<'_>, operand: Operand) -> bool {
+            this.$method(operand)
         }
-    }
+
+        inner
+    }};
 }
 
 macro_rules! oper {
-    ($operand:ident) => {
-        {
-            fn inner(this: &mut CPU6502<'_>) -> u8 {
-                this.$operand()
-            }
-            
-            inner
+    ($operand:ident) => {{
+        fn inner(this: &mut CPU6502<'_>) -> Operand {
+            this.$operand()
         }
-    }
+
+        inner
+    }};
 }
 
 macro_rules! info {
-    ($name:expr, $inst:expr, $oper:expr, $cycles:expr) => {
-        {
-            Info {
-                name: $name,
-                executor: $inst,
-                operands: $oper,
-                cycles: $cycles,
-            }
+    ($name:expr, $inst:expr, $oper:expr, $cycles:expr) => {{
+        Info {
+            name: $name,
+            executor: $inst,
+            operands: $oper,
+            cycles: $cycles,
         }
-    }
+    }};
 }
 
+/// Provides a lookup table for all instructions that the emulator supports. This table is
+/// how instruction/operand handlers are dispatched, and how the emulator gets cycle information
+/// for a given instruction. 
 #[rustfmt::skip]
-pub(crate) const INSTR_LOOKUP: [Info; 256] = [
+const INSTR_LOOKUP: [Info; 256] = [
     //        x0                                      x1                                       x2                                       x3                                       x4                                       x5                                       x6                                       x7                                       x8                                       x9                                       xA                                       xB                                       xC                                       xD                                       xE                                       xF
     /* 0x */ info!("brk", inst!(brk), oper!(imp), 7), info!("ora", inst!(ora), oper!(izx), 6), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("ora", inst!(ora), oper!(zpo), 3), info!("asl", inst!(asl), oper!(zpo), 5), info!("???", inst!(ill), oper!(imp), 1), info!("php", inst!(php), oper!(imp), 3), info!("ora", inst!(ora), oper!(imm), 2), info!("asl", inst!(asl), oper!(imm), 2), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("ora", inst!(ora), oper!(abs), 4), info!("asl", inst!(asl), oper!(abs), 6), info!("???", inst!(ill), oper!(imp), 1),
     /* 1x */ info!("bpl", inst!(bpl), oper!(rel), 2), info!("ora", inst!(ora), oper!(izy), 5), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("ora", inst!(ora), oper!(zpx), 4), info!("asl", inst!(asl), oper!(zpx), 6), info!("???", inst!(ill), oper!(imp), 1), info!("clc", inst!(clc), oper!(imp), 2), info!("ora", inst!(ora), oper!(aby), 4), info!("???", inst!(ill), oper!(imp), 2), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("ora", inst!(ora), oper!(abx), 4), info!("asl", inst!(asl), oper!(abx), 7), info!("???", inst!(ill), oper!(imp), 1),
@@ -74,3 +76,9 @@ pub(crate) const INSTR_LOOKUP: [Info; 256] = [
     /* Ex */ info!("cpx", inst!(cpx), oper!(imm), 2), info!("sbc", inst!(sbc), oper!(izx), 6), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("cpx", inst!(cpx), oper!(zpo), 3), info!("sbc", inst!(sbc), oper!(zpo), 3), info!("inc", inst!(inc), oper!(zpo), 5), info!("???", inst!(ill), oper!(imp), 1), info!("inx", inst!(inx), oper!(imp), 2), info!("sbc", inst!(sbc), oper!(imm), 2), info!("nop", inst!(nop), oper!(imp), 2), info!("???", inst!(ill), oper!(imp), 1), info!("cpx", inst!(cpx), oper!(abs), 4), info!("sbc", inst!(sbc), oper!(abs), 4), info!("inc", inst!(inc), oper!(abs), 6), info!("???", inst!(ill), oper!(imp), 1),
     /* Fx */ info!("beq", inst!(beq), oper!(rel), 2), info!("sbc", inst!(sbc), oper!(izy), 5), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("sbc", inst!(sbc), oper!(zpx), 4), info!("inc", inst!(inc), oper!(zpx), 6), info!("???", inst!(ill), oper!(imp), 1), info!("sed", inst!(sed), oper!(imp), 2), info!("sbc", inst!(sbc), oper!(aby), 4), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("???", inst!(ill), oper!(imp), 1), info!("sbc", inst!(sbc), oper!(abx), 4), info!("inc", inst!(inc), oper!(abx), 7), info!("???", inst!(ill), oper!(imp), 1),
 ];
+
+/// Performs a lookup into the instruction table based on the opcode `opcode`,
+/// and returns the instruction information for that opcode.
+pub(crate) fn lookup_instruction(opcode: u8) -> &'static Info {
+    &INSTR_LOOKUP[opcode as usize]
+}

@@ -8,18 +8,64 @@
 //                                                                           //
 //======---------------------------------------------------------------======//
 
+pub trait Device {
+    const START: u16;
+
+    const END: u16;
+
+    fn read(&mut self, address: u16, bus_data: u8) -> u8;
+
+    fn write(&mut self, address: u16, data: u8);
+}
+
+struct RAM {
+    data: Box<[u8; u16::MAX as usize]>,
+}
+
+impl RAM {
+    pub fn new() -> Self {
+        Self {
+            data: Box::new([0 as u8; u16::MAX as usize]),
+        }
+    }
+}
+
+impl Device for RAM {
+    const START: u16 = 0;
+    const END: u16 = u16::MAX;
+
+    fn read(&mut self, address: u16, _bus_data: u8) -> u8 {
+        self.data[address as usize]
+    }
+
+    fn write(&mut self, address: u16, data: u8) {
+        self.data[address as usize] = data;
+    }
+}
+
 pub struct Bus {
-    /// The last address used by any instruction
-    address: u16,
-    /// The last data written to the bus
-    data: u8,
+    address: u16, // last address read/written to
+    data: u8,     // last data written
+    ram: RAM,
 }
 
 impl Bus {
-    pub fn read(&mut self, address: u16) -> u8 {
+    pub fn new() -> Self {
+        Self {
+            address: 0,
+            data: 0,
+            ram: RAM::new(),
+        }
+    }
+
+    pub fn read(&mut self, address: u16, _read_only: bool) -> u8 {
         self.address = address;
 
-        unimplemented!()
+        if RAM::START <= self.address && self.address <= RAM::END {
+            self.ram.read(self.address, self.data);
+        }
+
+        0 // default value for out-of-bounds
     }
 
     pub fn write(&mut self, address: u16, data: u8) {
