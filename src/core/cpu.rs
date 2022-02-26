@@ -8,6 +8,7 @@
 //                                                                           //
 //======---------------------------------------------------------------======//
 
+use crate::core::disassembler;
 use crate::core::lookup::{lookup_instruction, Info};
 use crate::core::Bus;
 use crate::numeric::Arithmetic6502;
@@ -50,9 +51,56 @@ macro_rules! clear_flag {
     }};
 }
 
+macro_rules! set_flag {
+    ($self:ident, $flag:ident) => {{
+        $self.set_flag(StatusFlag::$flag, true);
+
+        false
+    }};
+}
+
+macro_rules! store_reg {
+    ($self:ident, $operand:ident, $reg:ident) => {{
+        let address = $operand.address();
+
+        $self.write(address, $self.$reg);
+
+        false
+    }};
+}
+
+macro_rules! transfer_reg {
+    ($self:ident, sp, $to:ident) => {{
+        $self.$to = $self.sp as u8;
+
+        false
+    }};
+    ($self:ident, $from:ident, sp) => {{
+        $self.sp = $self.$from as u16;
+
+        false
+    }};
+    ($self:ident, $from:ident, $to:ident) => {{
+        $self.$to = $self.$from;
+
+        false
+    }};
+}
+
 /// Gets an offset into the zero page, starting at `start`
 fn zp_address(start: u8, offset: u8) -> u16 {
     ((start as u16) + (offset as u16)) % 256
+}
+
+/// Checks if an operation overflowed given two inputs and an output
+fn overflowed(a: u8, b: u8, result: u8) -> bool {
+    let a_msb = a & 0b1000_0000;
+    let b_msb = b & 0b1000_0000;
+    let result_msb = result & 0b1000_0000;
+
+    // MSB = sign bit, if sign of lhs & rhs are the same and
+    // they differ from result, we overflowed
+    (a_msb == b_msb) && (a_msb != result_msb)
 }
 
 /// An operand to an instruction
@@ -111,21 +159,36 @@ pub enum StatusFlag {
 }
 
 pub struct CPU6502<'a> {
-    bus: &'a mut Bus,
-    a: u8,            // accumulator
-    x: u8,            // gp register
-    y: u8,            // gp register
-    p: u8,            // status register
-    sp: u16,          // stack pointer
-    pc: u16,          // program counter
-    cycles_left: u16, // counts the number of cycles we need to "eat" to maintain timing
-    opcode: u8,       // the current opcode
+    pub(in crate::core) bus: &'a mut Bus,
+    pub(in crate::core) a: u8,            // accumulator
+    pub(in crate::core) x: u8,            // gp register
+    pub(in crate::core) y: u8,            // gp register
+    pub(in crate::core) p: u8,            // status register
+    pub(in crate::core) sp: u16,          // stack pointer
+    pub(in crate::core) pc: u16,          // program counter
+    pub(in crate::core) cycles_left: u16, // counts the number of cycles we need to "eat" to maintain timing
+    pub(in crate::core) prev_len: u16,    // the length of the previous 8 opcodes
+    pub(in crate::core) opcode: u8,       // the current opcode
 }
 
 impl<'a> CPU6502<'a> {
+    /// Address of the stack in the memory
+    pub const STACK_START: u16 = 0x0100;
+
+    /// *(0xFFFC) holds the address to start execution at
+    pub const STARTUP_HANDLER: u16 = 0xFFFC;
+
+    /// *(0xFFFE) holds the address to start executing at after
+    /// an interrupt is caught
+    pub const INTERRUPT_HANDLER: u16 = 0xFFFE;
+
+    /// *(0xFFFE) holds the address to start executing at after
+    /// a non-maskable interrupt is caught
+    pub const NON_MASKABLE_INTERRUPT_HANDLER: u16 = 0xFFFA;
+
     /// Creates a new 6502 CPU emulator in a "reset" state.
     pub fn new(bus: &'a mut Bus) -> Self {
-        Self {
+        let mut object = Self {
             bus,
             a: 0,
             x: 0,
@@ -134,8 +197,15 @@ impl<'a> CPU6502<'a> {
             sp: 0,
             pc: 0,
             cycles_left: 0,
+            prev_len: 0,
             opcode: 0,
-        }
+        };
+
+        // we want to use the `self.read_address` code, plus having the
+        // "reset" state in one place is nicer for code organization
+        object.reset();
+
+        object
     }
 
     /// Runs a single CPU cycle. If a previous instruction has any cycles "remaining,"
@@ -165,22 +235,39 @@ impl<'a> CPU6502<'a> {
         self.x = 0;
         self.y = 0;
         self.p = 0;
-        self.sp = 0;
-        self.pc = 0;
-        self.cycles_left = 0;
+        self.sp = 0xFF;
+        self.pc = self.read_address(0xFFFC); // 0xFFFC holds a start address
+        self.cycles_left = 8; // resets take a bit of time
+        self.prev_len = 0; // empty previous opcodes
         self.opcode = 0;
+    }
+
+    fn handle_interrupt(&mut self, address: u16, is_break: bool) {
+        // can't handle other interrupts during this
+        self.set_flag(StatusFlag::B, is_break);
+        self.set_flag(StatusFlag::I, true);
+
+        // pc is next instruction
+        self.push_address(self.pc);
+        self.push(self.p);
+
+        // jump to handler on next non-burn cycle
+        self.pc = self.read_address(address);
+        self.cycles_left = 7;
     }
 
     /// Requests that an interrupt be handled, this is a non-binding request. This only runs
     /// if the `I` flag is not set.
     pub fn interrupt_request(&mut self) {
-        todo!()
+        if self.is_unset(StatusFlag::I) {
+            self.handle_interrupt(Self::INTERRUPT_HANDLER, false);
+        }
     }
 
     /// Tells the CPU that there's an interrupt happening that must be handled. Ignores the
     /// `I` flag.
     pub fn interrupt_non_maskable(&mut self) {
-        todo!()
+        self.handle_interrupt(Self::NON_MASKABLE_INTERRUPT_HANDLER, false);
     }
 
     /// Sets a status flag to the specified value
@@ -200,10 +287,17 @@ impl<'a> CPU6502<'a> {
     }
 
     /// Moves to the next instruction, updates PC
-    fn next_instruction(&mut self) -> &'static Info {
+    pub(in crate::core) fn next_instruction(&mut self) -> &'static Info {
         self.opcode = self.read_pc();
 
-        lookup_instruction(self.opcode)
+        let info = lookup_instruction(self.opcode);
+        let len = disassembler::instruction_length(info);
+
+        // rotate bits by 2 to free up 2 bits of space, fill those 2 bits with new len
+        self.prev_len <<= 2;
+        self.prev_len |= (len as u16); // `len` is between 1-3
+
+        info
     }
 
     /// Updates the N/Z flags based on a byte value
@@ -221,7 +315,22 @@ impl<'a> CPU6502<'a> {
 
     /// Reads a byte at `address`
     fn read(&mut self, address: u16) -> u8 {
-        self.bus.read(address, false)
+        self.bus.read(address)
+    }
+
+    /// Used to read memory from the CPU's perspective
+    pub fn read_nocycle(&self, address: u16) -> u8 {
+        self.bus.read_nocycle(address)
+    }
+
+    /// Checks if the CPU is "burning" cycles for an instruction
+    pub fn is_cycling(&self) -> bool {
+        self.cycles_left != 0
+    }
+
+    /// Reads the current opcode value
+    pub fn read_pc_nocycle(&self) -> u8 {
+        self.bus.read_nocycle(self.pc)
     }
 
     /// Reads a little-endian address from `address`
@@ -239,10 +348,43 @@ impl<'a> CPU6502<'a> {
         self.read_address(self.pc - 2)
     }
 
-    fn write(&mut self, address: u16, value: u8) {
+    /// Writes a byte to the bus on a given address
+    pub fn write(&mut self, address: u16, value: u8) {
         self.bus.write(address, value);
     }
 
+    /// Pushes a value onto the stack, moves the stack pointer down
+    fn push(&mut self, value: u8) {
+        // stack grows downwards, starting at 0x01FF down to 0x0100
+        self.write(Self::STACK_START + self.sp, value);
+        self.sp -= 1;
+    }
+
+    /// Properly pushes a 16bit address onto the stack
+    fn push_address(&mut self, address: u16) {
+        let [low, high] = address.to_le_bytes();
+
+        // stack grows downwards
+        self.push(high);
+        self.push(low);
+    }
+
+    /// Pops a value from the stack, moves the stack pointer up
+    fn pop(&mut self) -> u8 {
+        // we don't need to overwrite the old value on the stack
+        self.sp += 1;
+        self.read(Self::STACK_START + self.sp)
+    }
+
+    /// Properly pops a 16bit address off of the stack
+    fn pop_address(&mut self) -> u16 {
+        let low = self.pop();
+        let high = self.pop();
+
+        u16::from_le_bytes([low, high])
+    }
+
+    /// Compares an operand value with a given byte from a register
     fn cmp_with(&mut self, operand: Operand, reg: u8) -> bool {
         let (value, paged) = operand.value(self);
         let (result, carry) = value.sub_with_carry(reg, self.is_set(StatusFlag::C));
@@ -422,13 +564,14 @@ impl<'a> CPU6502<'a> {
 
     /// Add to Accumulator with Carry: Performs add-with-carry, adding 1 if the carry flag is set.
     ///
-    /// Updates: `N`, `Z`, `C`
+    /// Updates: `N`, `Z`, `C`, `V`
     pub fn adc(&mut self, operand: Operand) -> bool {
         let (value, paged) = operand.value(self);
-        let (value, carry) = value.add_with_carry(self.a, self.is_set(StatusFlag::C));
+        let (result, carry) = value.add_with_carry(self.a, self.is_set(StatusFlag::C));
 
-        self.a = value;
+        self.a = result;
         self.set_flag(StatusFlag::C, carry);
+        self.set_flag(StatusFlag::V, overflowed(value, self.a, result));
         self.update_nz(self.a);
 
         paged
@@ -452,9 +595,9 @@ impl<'a> CPU6502<'a> {
     pub fn asl(&mut self, operand: Operand) -> bool {
         let (value, _) = operand.value(self);
         let result = value << 1;
-        let carry = value & 0b1000_0000;
 
-        self.set_flag(StatusFlag::C, carry != 0);
+        self.set_flag(StatusFlag::C, (value & 0b1000_0000) != 0);
+        self.update_nz(result);
 
         // can't shift an immediate, can only shift A or an address
         if operand.should_load {
@@ -482,8 +625,20 @@ impl<'a> CPU6502<'a> {
         branch_if_set!(self, operand, Z)
     }
 
+    /// Test Bits in Accumulator: Put bits 6/7 of `operand` into P,
+    /// changing `N` and `V` and set Z flags based on `operand & A`
+    ///
+    /// Affects: `N`, `Z`, `V`
     pub fn bit(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+        let v = value & (1 << StatusFlag::V as u8);
+        let n = value & (1 << StatusFlag::N as u8);
+
+        self.set_flag(StatusFlag::Z, value & self.a == 0);
+        self.set_flag(StatusFlag::V, v == 0);
+        self.set_flag(StatusFlag::N, n == 0);
+
+        paged
     }
 
     /// Branch on Minus: Branches when the Negative flag is set
@@ -501,8 +656,15 @@ impl<'a> CPU6502<'a> {
         branch_if_unset!(self, operand, N)
     }
 
-    pub fn brk(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Break: Causes a non-maskable interrupt and jumps to a break handler
+    pub fn brk(&mut self, _: Operand) -> bool {
+        // the return address is 1 byte *after* the brk, to give 1 byte of
+        // space for break information of some kind
+        self.pc += 1;
+
+        self.handle_interrupt(Self::INTERRUPT_HANDLER, true);
+
+        false
     }
 
     /// Branch on Overflow Clear: Branches when the Overflow flag is unset
@@ -625,7 +787,7 @@ impl<'a> CPU6502<'a> {
     /// Increment X: Increments the X register
     ///
     /// Affects flags: `N`, `Z`
-    pub fn inx(&mut self, operand: Operand) -> bool {
+    pub fn inx(&mut self, _: Operand) -> bool {
         self.x = self.x.wrapping_add(1);
         self.update_nz(self.x);
 
@@ -635,7 +797,7 @@ impl<'a> CPU6502<'a> {
     /// Increment Y: Increments the Y register
     ///
     /// Affects flags: `N`, `Z`
-    pub fn iny(&mut self, operand: Operand) -> bool {
+    pub fn iny(&mut self, _: Operand) -> bool {
         self.y = self.y.wrapping_add(1);
         self.update_nz(self.y);
 
@@ -649,115 +811,257 @@ impl<'a> CPU6502<'a> {
         false
     }
 
+    /// Jump to Subroutine: Pushes address of next instruction minus one onto the stack
+    /// and jumps to the given subroutine
     pub fn jsr(&mut self, operand: Operand) -> bool {
-        todo!()
+        self.push_address(self.pc - 1); // self.pc is next instruction right now
+        self.pc = operand.address();
+
+        false
     }
 
+    /// Load Accumulator: Loads a value into A
+    ///
+    /// Affects: `N`, `Z`
     pub fn lda(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+
+        self.a = value;
+        self.update_nz(self.a);
+
+        paged
     }
 
+    /// Load X: Loads a value into X
+    ///
+    /// Affects: `N`, `Z`
     pub fn ldx(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+
+        self.x = value;
+        self.update_nz(self.x);
+
+        paged
     }
 
+    /// Load Y: Loads a value into Y
+    ///
+    /// Affects: `N`, `Z`
     pub fn ldy(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+
+        self.x = value;
+        self.update_nz(self.x);
+
+        paged
     }
 
+    /// Logical Shift Right: Shifts the operand by 1 bit right. LSB is put into carry,
+    /// MSB becomes zero.
+    ///
+    /// Affects: `N`, `Z`, `C`
     pub fn lsr(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, _) = operand.value(self);
+        let result = value >> 1;
+
+        self.set_flag(StatusFlag::C, (value & 0b0000_0001) != 0);
+        self.update_nz(result);
+
+        // can't shift an immediate, can only shift A or an address
+        if operand.should_load {
+            self.write(operand.address(), result);
+        } else {
+            self.a = result;
+        }
+
+        // never dependent on pages
+        false
     }
 
-    pub fn nop(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// No-op: Do nothing for a few cycles.
+    pub fn nop(&mut self, _: Operand) -> bool {
+        false
     }
 
+    /// OR with Accumulator: Performs bitwise OR between the operand
+    /// and the A register, put result in A.
+    ///
+    /// Affects: `N`, `Z`
     pub fn ora(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+
+        self.a |= value;
+        self.update_nz(self.a);
+
+        paged
     }
 
-    pub fn pha(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Push Accumulator: Pushes A onto the stack
+    pub fn pha(&mut self, _: Operand) -> bool {
+        self.push(self.a);
+
+        false
     }
 
-    pub fn php(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Push Processor Status: Pushes the status flag register onto the stack
+    pub fn php(&mut self, _: Operand) -> bool {
+        self.push(self.p);
+
+        false
     }
 
-    pub fn pla(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Pull Accumulator: Pops a value from the stack and sets A to it
+    pub fn pla(&mut self, _: Operand) -> bool {
+        self.a = self.pop();
+
+        false
     }
 
-    pub fn plp(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Pull Processor Status: Pops a value from the stack and sets
+    /// the status register to it
+    pub fn plp(&mut self, _: Operand) -> bool {
+        self.p = self.pop();
+
+        false
     }
 
+    /// Rotate Left: Rotates the operand left by one bit. Carry is shifted into bit 0,
+    /// bit 7 is shifted into carry.
+    ///
+    /// Affects: `N`, `Z`, `C`
     pub fn rol(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, _) = operand.value(self);
+        let result = (value << 1) | (self.is_set(StatusFlag::C) as u8);
+
+        self.set_flag(StatusFlag::C, (value & 0b1000_0000) != 0);
+        self.update_nz(result);
+
+        // can't shift an immediate, can only shift A or an address
+        if operand.should_load {
+            self.write(operand.address(), result);
+        } else {
+            self.a = result;
+        }
+
+        // never dependent on pages
+        false
     }
 
+    /// Rotate Right: Rotates the value right by one bit. The carry is shifted
+    /// into bit 7 and bit 0 is shifted into carry.
+    ///
+    /// Affects: `N`, `Z`, `C`
     pub fn ror(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, _) = operand.value(self);
+        let result = (value >> 1) | ((self.is_set(StatusFlag::C) as u8) << 7);
+
+        self.set_flag(StatusFlag::C, (value & 0b0000_0001) != 0);
+        self.update_nz(result);
+
+        // can't shift an immediate, can only shift A or an address
+        if operand.should_load {
+            self.write(operand.address(), result);
+        } else {
+            self.a = result;
+        }
+
+        // never dependent on pages
+        false
     }
 
-    pub fn rti(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Return from Interrupt: Restore program state that was saved
+    /// from an interrupt, and resume execution
+    pub fn rti(&mut self, _: Operand) -> bool {
+        self.p = self.pop();
+        self.pc = self.pop_address();
+        self.set_flag(StatusFlag::B, false);
+
+        false
     }
 
-    pub fn rts(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Return from Subroutine: Pops the return address off of the stack and jumps to it
+    pub fn rts(&mut self, _: Operand) -> bool {
+        let address = self.pop_address();
+
+        self.pc = address + 1;
+
+        false
     }
 
+    /// Subtract with Carry: Uses the carry flag as an inverse borrow, performs subtraction
+    /// and updates the carry flag as needed.
+    ///
+    /// Affects: `N`, `Z`, `C`, `V`
     pub fn sbc(&mut self, operand: Operand) -> bool {
-        todo!()
+        let (value, paged) = operand.value(self);
+        let (result, carry) = value.sub_with_carry(self.a, self.is_set(StatusFlag::C));
+
+        self.a = result;
+        self.set_flag(StatusFlag::C, carry);
+        self.set_flag(StatusFlag::V, overflowed(value, self.a, result));
+        self.update_nz(self.a);
+
+        paged
     }
 
-    pub fn sec(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Set Carry: Sets the carry flag
+    pub fn sec(&mut self, _: Operand) -> bool {
+        set_flag!(self, C)
     }
 
-    pub fn sed(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Set Decimal: Sets the decimal flag
+    pub fn sed(&mut self, _: Operand) -> bool {
+        set_flag!(self, D)
     }
 
-    pub fn sei(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Set Interrupt: Sets the disable interrupts flag
+    pub fn sei(&mut self, _: Operand) -> bool {
+        set_flag!(self, I)
     }
 
+    /// Store Accumulator: Stores the value in A to the address given
+    /// in the operand
     pub fn sta(&mut self, operand: Operand) -> bool {
-        todo!()
+        store_reg!(self, operand, a)
     }
 
+    /// Store X: Stores the value in X to the address given in the operand
     pub fn stx(&mut self, operand: Operand) -> bool {
-        todo!()
+        store_reg!(self, operand, x)
     }
 
+    /// Store Y: Stores the value in Y to the address given in the operand
     pub fn sty(&mut self, operand: Operand) -> bool {
-        todo!()
+        store_reg!(self, operand, y)
     }
 
-    pub fn tax(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer A to X: Copies the value of A into X
+    pub fn tax(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, a, x)
     }
 
-    pub fn tay(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer A to Y: Copies the value of A into Y
+    pub fn tay(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, a, y)
     }
 
-    pub fn tsx(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer SP to X: Truncates the value of SP and copies it to X
+    pub fn tsx(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, sp, x)
     }
 
-    pub fn txa(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer X to A: Copies the value of X into A
+    pub fn txa(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, x, a)
     }
 
-    pub fn txs(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer X to SP: Extends the value of X and copies it into SP
+    pub fn txs(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, x, sp)
     }
 
-    pub fn tya(&mut self, operand: Operand) -> bool {
-        todo!()
+    /// Transfer Y to A: Copies the value of Y into A
+    pub fn tya(&mut self, _: Operand) -> bool {
+        transfer_reg!(self, y, a)
     }
 }

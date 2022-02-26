@@ -8,10 +8,12 @@
 //                                                                           //
 //======---------------------------------------------------------------======//
 
-mod bus;
-mod cpu;
-mod clock;
-mod lookup;
+pub mod bus;
+pub mod clock;
+pub mod cpu;
+pub mod disassembler;
+pub mod lookup;
 
 pub use bus::*;
 pub use cpu::*;
+pub use disassembler::*;

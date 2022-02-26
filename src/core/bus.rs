@@ -15,17 +15,19 @@ pub trait Device {
 
     fn read(&mut self, address: u16, bus_data: u8) -> u8;
 
+    fn read_nocycle(&self, address: u16, bus_data: u8) -> u8;
+
     fn write(&mut self, address: u16, data: u8);
 }
 
 struct RAM {
-    data: Box<[u8; u16::MAX as usize]>,
+    data: Box<[u8; (u16::MAX as usize) + 1]>,
 }
 
 impl RAM {
     pub fn new() -> Self {
         Self {
-            data: Box::new([0 as u8; u16::MAX as usize]),
+            data: Box::new([0 as u8; (u16::MAX as usize) + 1]),
         }
     }
 }
@@ -35,6 +37,10 @@ impl Device for RAM {
     const END: u16 = u16::MAX;
 
     fn read(&mut self, address: u16, _bus_data: u8) -> u8 {
+        self.data[address as usize]
+    }
+
+    fn read_nocycle(&self, address: u16, _bus_data: u8) -> u8 {
         self.data[address as usize]
     }
 
@@ -58,20 +64,28 @@ impl Bus {
         }
     }
 
-    pub fn read(&mut self, address: u16, _read_only: bool) -> u8 {
+    pub fn read(&mut self, address: u16) -> u8 {
         self.address = address;
 
-        if RAM::START <= self.address && self.address <= RAM::END {
-            self.ram.read(self.address, self.data);
+        self.read_nocycle(self.address)
+    }
+
+    pub fn read_nocycle(&self, address: u16) -> u8 {
+        if RAM::START <= address && address <= RAM::END {
+            return self.ram.read_nocycle(address, self.data);
         }
 
-        0 // default value for out-of-bounds
+        0
     }
 
     pub fn write(&mut self, address: u16, data: u8) {
         self.address = address;
         self.data = data;
 
-        unimplemented!()
+        println!("writing {:02X} to {:04X}", data, address);
+
+        if RAM::START <= self.address && self.address <= RAM::END {
+            self.ram.write(self.address, self.data);
+        }
     }
 }
